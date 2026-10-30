@@ -1,0 +1,46 @@
+[project]
+name = "scietex.vfd_service"
+description = "Scietex microservice daemon for variable frequency drive monitoring and control"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+authors = [{ name = "Anton Bondarenko", email = "bond.anton@gmail.com" }]
+classifiers = [
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "scietex.service[valkey]~=6.2.0",
+  "scietex.hal.vfd>=2.0.0,<3.0.0",
+  "pymodbus~=3.15",
+]
+dynamic = ["version"]
+
+[project.urls]
+"Bug Tracker" = "https://github.com/bond-anton/scietex.vfd_service/issues"
+"Homepage" = "https://github.com/bond-anton/scietex.vfd_service"
+
+[project.scripts]
+start-vfd-service = "scietex.vfd_service.run_worker:main"
+
+[project.optional-dependencies]
+dev = ["tox>=4.45.0"]
+lint = ["ruff", "ty"]
+test = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "scietex.vfd_service.version.__version__" }
+
+[tool.setuptools.package-data]
+"scietex.vfd_service" = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
