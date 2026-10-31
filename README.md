@@ -89,10 +89,25 @@ unsupported command is rejected as `UNSUPPORTED` before the driver is called.
 - Readings stream: `scietex:{service}:{instance_id}:vfd:{label}:readings`
   with fields `ts`, `frequency_hz`, `frequency_percent`, `output_current`,
   `output_voltage`, `output_power`, `dc_bus_voltage`, `heatsink_temperature_c`,
-  `motor_temperature_c`, `state`. A field the drive does not report is written
-  as an empty value, which is distinguishable from a reported `0.0`.
+  `motor_temperature_c`, `state`, `total_run_hours`, `total_power_on_hours`. A
+  field the drive does not report is written as an empty value, which is
+  distinguishable from a reported `0.0`.
 - Telemetry: `scietex:{service}:{instance_id}:telemetry`, pushed every 2 s with
   a 6 s TTL.
+
+## Working hours
+
+`total_run_hours` and `total_power_on_hours` are the drive's own counters when
+it keeps them, otherwise the worker's accumulation. The telemetry entry carries
+`hours_source` to say which: `"drive"`, `"accumulated"`, or `null` when neither
+is available yet.
+
+The accumulation credits the elapsed time between two successful readings,
+capped at `MAX_ACCUMULATION_GAP` (60 s) so a worker that was stopped does not
+credit its downtime to the drive. The powered-on counter is credited on every
+reading; the run counter only while the drive reports a running state. It is
+in-memory: a worker restart resets it, which is why a drive that reports its own
+counters is always preferred.
 
 ## Running
 

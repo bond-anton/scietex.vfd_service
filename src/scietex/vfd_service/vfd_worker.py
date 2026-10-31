@@ -30,7 +30,7 @@ from glide import (
     TimeoutError as GlideTimeoutError,
 )
 from pymodbus.exceptions import ConnectionException, ModbusIOException
-from scietex.hal.vfd.base.data import VFDParameters
+from scietex.hal.vfd.base.data import VFDParameters, VFDState
 from scietex.hal.vfd.base.protocol import VFDProtocol
 from scietex.service import Manager, ValkeyWorker, ValkeyWorkerConfig
 from scietex.service.valkey._glide import StreamAddOptions, TrimByMaxLen
@@ -58,6 +58,12 @@ STREAM_MAXLEN: int = 10000
 #: ``VFDServiceSettings.failure_threshold``.
 CONNECTED_FAILURE_THRESHOLD: int = 3
 
+#: Longest gap between two successful readings that the software hours
+#: accumulator credits to a drive. A worker that was stopped, or a drive that
+#: was unreachable for hours, must not have that downtime counted as run time;
+#: the cap is generous enough that a normal poll interval never hits it.
+MAX_ACCUMULATION_GAP: float = 60.0
+
 
 class VFDStats(msgspec.Struct):
     """Per-drive counters accumulated by the poll loop.
@@ -74,6 +80,13 @@ class VFDStats(msgspec.Struct):
     # not flip the drive to disconnected, so the poll loop only clears
     # `_connected` once this reaches the configured failure threshold.
     consecutive_failures: int = 0
+    # Software hours for a drive that keeps no run-time counter of its own.
+    # The poll loop credits the elapsed time between two successful readings,
+    # capped at `MAX_ACCUMULATION_GAP` so a worker that was stopped for a day
+    # does not credit that day to the drive. Both stay 0 for a drive that
+    # reports its own counters; the telemetry prefers the drive's value.
+    accumulated_run_seconds: float = 0.0
+    accumulated_power_on_seconds: float = 0.0
 
 
 def resolve_driver(name: str) -> type[VFDProtocol]:
@@ -507,12 +520,38 @@ class VFDWorker(ValkeyWorker):
             stats = self._stats[label]
             stats.consecutive_failures = 0
             stats.reading_count += 1
+            now = datetime.now(timezone.utc)
+            self._accumulate_hours(stats, parameters, now)
             stats.last_parameters = parameters
-            stats.last_reading_at = datetime.now(timezone.utc)
+            stats.last_reading_at = now
             stats.last_error = None
             await self._publish_reading(label, parameters, stats.last_reading_at)
 
             await self._sleep(drive_settings.poll_interval)
+
+    def _accumulate_hours(self, stats: VFDStats, parameters: VFDParameters, now: datetime) -> None:
+        """Credit the elapsed time since the previous reading to the software hours.
+
+        Only a drive that reports no run-time counter of its own is
+        accumulated: a drive that does report one is authoritative, and adding
+        to a parallel software count would give two disagreeing totals.
+
+        The elapsed time is capped at `MAX_ACCUMULATION_GAP`, so a worker that
+        was stopped for a day does not credit that day to the drive. The
+        powered-on counter is credited on every successful reading; the run
+        counter only while the drive reports a running state.
+        """
+        if parameters.total_run_hours is not None:
+            return
+        previous = stats.last_reading_at
+        if previous is None:
+            return
+        elapsed = min((now - previous).total_seconds(), MAX_ACCUMULATION_GAP)
+        if elapsed <= 0:
+            return
+        stats.accumulated_power_on_seconds += elapsed
+        if parameters.state in (VFDState.RUNNING_FORWARD, VFDState.RUNNING_BACKWARD):
+            stats.accumulated_run_seconds += elapsed
 
     def _record_error(self, label: str, exc: Exception, stage: str) -> None:
         """Increment a drive's error counters and log a WARNING."""
@@ -546,6 +585,8 @@ class VFDWorker(ValkeyWorker):
                     (b"heatsink_temperature_c", encode_value(parameters.heatsink_temperature_c)),
                     (b"motor_temperature_c", encode_value(parameters.motor_temperature_c)),
                     (b"state", parameters.state.name.encode()),
+                    (b"total_run_hours", encode_value(parameters.total_run_hours)),
+                    (b"total_power_on_hours", encode_value(parameters.total_power_on_hours)),
                 ],
                 StreamAddOptions(trim=TrimByMaxLen(exact=False, threshold=self._stream_maxlen())),
             )

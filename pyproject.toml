@@ -12,7 +12,7 @@ classifiers = [
 ]
 dependencies = [
   "scietex.service[valkey]~=6.2.0",
-  "scietex.hal.vfd>=2.0.2,<3.0.0",
+  "scietex.hal.vfd>=2.1.0,<3.0.0",
   "pymodbus~=3.15",
 ]
 dynamic = ["version"]

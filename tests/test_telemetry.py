@@ -44,6 +44,9 @@ def test_drive_telemetry_accepts_none_optionals() -> None:
         heatsink_temperature_c=None,
         motor_temperature_c=None,
         state=None,
+        total_run_hours=None,
+        total_power_on_hours=None,
+        hours_source=None,
         last_reading_at=None,
         reading_count=0,
         error_count=0,
@@ -53,6 +56,8 @@ def test_drive_telemetry_accepts_none_optionals() -> None:
     assert drive.frequency_hz is None
     assert drive.heatsink_temperature_c is None
     assert drive.state is None
+    assert drive.total_run_hours is None
+    assert drive.hours_source is None
     assert drive.reading_count == 0
 
 
@@ -111,4 +116,45 @@ async def test_telemetry_without_reading_reports_none(tmp_path) -> None:
     assert drive.frequency_percent is None
     assert drive.state is None
     assert drive.last_reading_at is None
+    assert drive.total_run_hours is None
+    assert drive.hours_source is None
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_prefers_the_drive_counters(tmp_path) -> None:
+    """A drive that reports its own counters wins over the software accumulation."""
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(VFDServiceSettings(drives=[VFDSettings(label="a", driver=FAKE_DRIVER_NAME)]))
+    worker.stats["a"].last_parameters = VFDParameters(
+        frequency_hz=25.0,
+        frequency_percent=50.0,
+        total_run_hours=120.5,
+        total_power_on_hours=400.0,
+    )
+    worker.stats["a"].accumulated_run_seconds = 3600.0
+    worker.stats["a"].accumulated_power_on_seconds = 7200.0
+
+    drive = build_telemetry(worker).drives[0]
+
+    assert drive.total_run_hours == 120.5
+    assert drive.total_power_on_hours == 400.0
+    assert drive.hours_source == "drive"
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_falls_back_to_the_accumulation(tmp_path) -> None:
+    """A drive with no counters reports the worker's accumulated hours."""
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(VFDServiceSettings(drives=[VFDSettings(label="a", driver=FAKE_DRIVER_NAME)]))
+    worker.stats["a"].last_parameters = VFDParameters(frequency_hz=25.0, frequency_percent=50.0)
+    worker.stats["a"].accumulated_run_seconds = 5400.0
+    worker.stats["a"].accumulated_power_on_seconds = 10800.0
+
+    drive = build_telemetry(worker).drives[0]
+
+    assert drive.total_run_hours == pytest.approx(1.5)
+    assert drive.total_power_on_hours == pytest.approx(3.0)
+    assert drive.hours_source == "accumulated"
     await worker.close_drives()

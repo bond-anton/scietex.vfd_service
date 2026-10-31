@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING
 import msgspec
 
 if TYPE_CHECKING:
-    from .vfd_worker import VFDWorker
+    from scietex.hal.vfd.base.data import VFDParameters
+
+    from .vfd_worker import VFDStats, VFDWorker
 
 #: Push cadence and key TTL: 2 s interval, 6 s TTL so a single missed beat does
 #: not expire the key.
@@ -30,6 +32,12 @@ class VFDTelemetry(msgspec.Struct, frozen=True):
 
     The reading fields mirror `scietex.hal.vfd.base.data.VFDParameters`; the
     optional ones stay ``None`` when the drive does not report them.
+
+    ``total_run_hours`` and ``total_power_on_hours`` are the effective values:
+    the drive's own counters when it keeps them, otherwise the worker's
+    accumulation. ``hours_source`` says which — ``"drive"``, ``"accumulated"``,
+    or ``None`` when neither is available (no reading yet, or the drive reports
+    no counters and the worker has not accumulated a full hour).
     """
 
     label: str
@@ -45,6 +53,9 @@ class VFDTelemetry(msgspec.Struct, frozen=True):
     heatsink_temperature_c: float | None
     motor_temperature_c: float | None
     state: str | None
+    total_run_hours: float | None
+    total_power_on_hours: float | None
+    hours_source: str | None
     last_reading_at: datetime | None
     reading_count: int
     error_count: int
@@ -97,6 +108,7 @@ def _drive_telemetry(worker: VFDWorker, label: str, driver: str) -> VFDTelemetry
     """Build one drive's telemetry entry from its stats and last reading."""
     stats = worker.stats[label]
     parameters = stats.last_parameters
+    run_hours, power_on_hours, hours_source = _effective_hours(parameters, stats)
     return VFDTelemetry(
         label=label,
         driver=driver,
@@ -111,8 +123,34 @@ def _drive_telemetry(worker: VFDWorker, label: str, driver: str) -> VFDTelemetry
         heatsink_temperature_c=parameters.heatsink_temperature_c if parameters is not None else None,
         motor_temperature_c=parameters.motor_temperature_c if parameters is not None else None,
         state=parameters.state.name if parameters is not None else None,
+        total_run_hours=run_hours,
+        total_power_on_hours=power_on_hours,
+        hours_source=hours_source,
         last_reading_at=stats.last_reading_at,
         reading_count=stats.reading_count,
         error_count=stats.error_count,
         last_error=stats.last_error,
     )
+
+
+def _effective_hours(parameters: VFDParameters | None, stats: VFDStats) -> tuple[float | None, float | None, str | None]:
+    """Pick the drive's own counters or the worker's accumulation.
+
+    The drive wins whenever it reports a run-time counter: its value survives a
+    worker restart and covers the drive's whole life, which an accumulation
+    that starts when the worker starts cannot. The accumulation is the fallback
+    for a drive that keeps no counter at all.
+
+    Returns:
+        tuple: ``(run_hours, power_on_hours, source)``, where ``source`` is
+            ``"drive"``, ``"accumulated"`` or ``None``.
+    """
+    if parameters is not None and parameters.total_run_hours is not None:
+        return parameters.total_run_hours, parameters.total_power_on_hours, "drive"
+    if stats.accumulated_run_seconds > 0 or stats.accumulated_power_on_seconds > 0:
+        return (
+            stats.accumulated_run_seconds / 3600.0,
+            stats.accumulated_power_on_seconds / 3600.0,
+            "accumulated",
+        )
+    return None, None, None

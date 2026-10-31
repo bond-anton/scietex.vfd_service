@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 
 import msgspec
@@ -25,6 +26,7 @@ from scietex.vfd_service.telemetry import build_telemetry
 from scietex.vfd_service.vfd_worker import (
     CONNECTED_FAILURE_THRESHOLD,
     DRIVER_ENTRY_POINT_GROUP,
+    MAX_ACCUMULATION_GAP,
     STREAM_MAXLEN,
     VFDWorker,
     resolve_driver,
@@ -392,6 +394,8 @@ async def test_poll_loop_publishes_reading(tmp_path, monkeypatch) -> None:
         b"heatsink_temperature_c",
         b"motor_temperature_c",
         b"state",
+        b"total_run_hours",
+        b"total_power_on_hours",
     ]
     assert fields[b"frequency_hz"] == b"25.0"
     assert fields[b"frequency_percent"] == b"50.0"
@@ -401,6 +405,9 @@ async def test_poll_loop_publishes_reading(tmp_path, monkeypatch) -> None:
     # which is distinguishable from a reported 0.0.
     assert fields[b"motor_temperature_c"] == b""
     assert fields[b"state"] == b"RUNNING_FORWARD"
+    # This drive reports no run-time counter, so both hours encode as empty.
+    assert fields[b"total_run_hours"] == b""
+    assert fields[b"total_power_on_hours"] == b""
     assert options.trim.threshold == STREAM_MAXLEN
     assert options.trim.exact is False
 
@@ -440,6 +447,105 @@ async def test_poll_loop_uses_configured_stream_maxlen(tmp_path, monkeypatch) ->
         await worker._poll_drive("a")
 
     assert fake.calls[0][2].trim.threshold == 250
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_accumulate_hours_credits_elapsed_time_while_running(tmp_path) -> None:
+    """A drive with no counters accrues both hours while it reports running."""
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(VFDServiceSettings(drives=[VFDSettings(label="a", driver=_DRIVER_NAME)]))
+    stats = worker.stats["a"]
+    stats.last_reading_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    worker._accumulate_hours(
+        stats,
+        VFDParameters(frequency_hz=25.0, frequency_percent=50.0, state=VFDState.RUNNING_FORWARD),
+        datetime(2026, 1, 1, 12, 0, 30, tzinfo=timezone.utc),
+    )
+
+    assert stats.accumulated_run_seconds == pytest.approx(30.0)
+    assert stats.accumulated_power_on_seconds == pytest.approx(30.0)
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_accumulate_hours_credits_only_power_on_while_stopped(tmp_path) -> None:
+    """A stopped drive is powered on but not running."""
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(VFDServiceSettings(drives=[VFDSettings(label="a", driver=_DRIVER_NAME)]))
+    stats = worker.stats["a"]
+    stats.last_reading_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    worker._accumulate_hours(
+        stats,
+        VFDParameters(frequency_hz=0.0, frequency_percent=0.0, state=VFDState.STOPPED),
+        datetime(2026, 1, 1, 12, 0, 30, tzinfo=timezone.utc),
+    )
+
+    assert stats.accumulated_run_seconds == 0.0
+    assert stats.accumulated_power_on_seconds == pytest.approx(30.0)
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_accumulate_hours_caps_a_long_gap(tmp_path) -> None:
+    """A worker that was stopped for a day must not credit that day to the drive."""
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(VFDServiceSettings(drives=[VFDSettings(label="a", driver=_DRIVER_NAME)]))
+    stats = worker.stats["a"]
+    stats.last_reading_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    worker._accumulate_hours(
+        stats,
+        VFDParameters(frequency_hz=25.0, frequency_percent=50.0, state=VFDState.RUNNING_FORWARD),
+        datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert stats.accumulated_run_seconds == pytest.approx(MAX_ACCUMULATION_GAP)
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_accumulate_hours_skips_a_drive_that_reports_its_own_counters(tmp_path) -> None:
+    """A drive with its own counter is authoritative; no parallel count is kept."""
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(VFDServiceSettings(drives=[VFDSettings(label="a", driver=_DRIVER_NAME)]))
+    stats = worker.stats["a"]
+    stats.last_reading_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    worker._accumulate_hours(
+        stats,
+        VFDParameters(
+            frequency_hz=25.0,
+            frequency_percent=50.0,
+            state=VFDState.RUNNING_FORWARD,
+            total_run_hours=120.5,
+            total_power_on_hours=400.0,
+        ),
+        datetime(2026, 1, 1, 12, 0, 30, tzinfo=timezone.utc),
+    )
+
+    assert stats.accumulated_run_seconds == 0.0
+    assert stats.accumulated_power_on_seconds == 0.0
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_accumulate_hours_skips_the_first_reading(tmp_path) -> None:
+    """Without a previous reading there is no elapsed time to credit."""
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(VFDServiceSettings(drives=[VFDSettings(label="a", driver=_DRIVER_NAME)]))
+    stats = worker.stats["a"]
+
+    worker._accumulate_hours(
+        stats,
+        VFDParameters(frequency_hz=25.0, frequency_percent=50.0, state=VFDState.RUNNING_FORWARD),
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert stats.accumulated_run_seconds == 0.0
+    assert stats.accumulated_power_on_seconds == 0.0
     await worker.close_drives()
 
 
