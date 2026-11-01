@@ -112,6 +112,25 @@ class _FakeVFD(VFDProtocol):
         return None
 
 
+class _StrictVFD(_FakeVFD):
+    """A driver whose constructor declares no ``max_frequency_hz``.
+
+    Mirrors the Intek SPE-B client, which always reads its maximum frequency
+    from the drive and therefore has no such parameter. Passing the keyword
+    must not reach it.
+    """
+
+    def __init__(self, host, port=502, unit_id=1, label="VFD", timeout=1.0, logger=None):
+        super().__init__(
+            host=host,
+            port=port,
+            unit_id=unit_id,
+            label=label,
+            timeout=timeout,
+            logger=logger,
+        )
+
+
 def _make_worker(tmp_path) -> VFDWorker:
     """Build a worker with a real conf_dir and no remote-config handlers."""
     return VFDWorker(
@@ -301,6 +320,32 @@ async def test_max_frequency_passed_only_when_configured(tmp_path) -> None:
 
     assert "max_frequency_hz" not in _drive(worker, "default").extra_kwargs
     assert _drive(worker, "explicit").extra_kwargs["max_frequency_hz"] == 60.0
+    await worker.close_drives()
+
+
+@pytest.mark.asyncio
+async def test_max_frequency_skipped_for_driver_without_the_parameter(tmp_path, monkeypatch) -> None:
+    """A driver that declares no ``max_frequency_hz`` still builds.
+
+    The Intek SPE-B client reads P0.10 from the drive and has no such
+    parameter, so passing the configured value raised ``TypeError`` and took
+    the whole drive registry down with it.
+    """
+    entry_point = EntryPoint(
+        name=_DRIVER_NAME,
+        value=f"{__name__}:_StrictVFD",
+        group=DRIVER_ENTRY_POINT_GROUP,
+    )
+    monkeypatch.setattr(worker_module, "entry_points", lambda group: [entry_point])
+
+    worker = _make_worker(tmp_path)
+    await worker._build_drives(
+        VFDServiceSettings(
+            drives=[VFDSettings(label="spe-b", driver=_DRIVER_NAME, max_frequency_hz=50.0)],
+        )
+    )
+
+    assert _drive(worker, "spe-b").extra_kwargs == {}
     await worker.close_drives()
 
 

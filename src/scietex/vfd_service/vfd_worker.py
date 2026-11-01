@@ -12,6 +12,7 @@ publishes readings to a per-drive Valkey stream.
 """
 
 import asyncio
+import inspect
 import logging
 from datetime import datetime, timezone
 from importlib.metadata import entry_points
@@ -125,6 +126,38 @@ def resolve_driver(name: str) -> type[VFDProtocol]:
     if not isinstance(obj, type):
         raise ValueError(f"Driver {name!r} resolved to {type(obj).__name__}, not a class")
     return cast(type[VFDProtocol], obj)
+
+
+def _accepts_keyword(driver: type, name: str) -> bool:
+    """Whether ``driver.__init__`` accepts a keyword argument called ``name``.
+
+    Drivers differ in what they take: the Vesper clients accept
+    ``max_frequency_hz`` as an override, while the Intek SPE-B client always
+    reads P0.10 from the drive and declares no such parameter. Passing it
+    unconditionally makes the SPE-B constructor raise ``TypeError`` and the
+    whole drive registry fail to build, so the worker asks first.
+
+    A driver that declares ``**kwargs`` accepts anything, which is why the
+    variadic check comes before the named-parameter check.
+
+    Args:
+        driver: The resolved driver class.
+        name: The keyword argument name to look for.
+
+    Returns:
+        bool: ``True`` when the constructor can be called with ``name=...``.
+    """
+    try:
+        parameters = inspect.signature(driver.__init__).parameters.values()
+    except (TypeError, ValueError):
+        # A C-level or otherwise uninspectable constructor: assume it does not
+        # take the optional keyword rather than risk a TypeError at build time.
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (parameter.name == name and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY)
+        for parameter in parameters
+    )
 
 
 def _is_transport_failure(exc: Exception) -> bool:
@@ -366,10 +399,21 @@ class VFDWorker(ValkeyWorker):
                 "timeout": settings.gateway.timeout,
                 "logger": self.logger,
             }
-            # Only pass the maximum frequency when configured: a driver that
-            # reads it from the drive itself must keep its own default.
+            # Only pass the maximum frequency when configured and when the
+            # driver takes it: a driver that reads it from the drive itself
+            # must keep its own default, and one that declares no such
+            # parameter would raise TypeError on construction.
             if drive_settings.max_frequency_hz is not None:
-                kwargs["max_frequency_hz"] = drive_settings.max_frequency_hz
+                if _accepts_keyword(driver, "max_frequency_hz"):
+                    kwargs["max_frequency_hz"] = drive_settings.max_frequency_hz
+                else:
+                    self.logger.warning(
+                        "Driver %r for drive %r does not accept max_frequency_hz; "
+                        "the configured %s Hz is ignored and the driver reads its own scale.",
+                        drive_settings.driver,
+                        label,
+                        drive_settings.max_frequency_hz,
+                    )
             drive = cast(Any, driver)(**kwargs)
             if not isinstance(drive, VFDProtocol):
                 self.logger.error("Driver %r for drive %r is not a VFDProtocol", drive_settings.driver, label)
